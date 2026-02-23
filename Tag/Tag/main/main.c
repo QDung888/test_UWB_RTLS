@@ -12,6 +12,8 @@
 #define NUM_ANCHORS 1
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
+#define RESPONSE_TIMEOUT_MS 50
+#define MAX_RETRIES 3
 
 #define FILTER_SIZE 30
 #define MIN_DISTANCE 0
@@ -47,9 +49,28 @@ static int tx_status;
 static int current_anchor_index = 0;
 static int curr_stage = 0;
 
+static unsigned long last_ranging_time = 0;
+static int retry_count = 0;
+
 static AnchorData anchors[NUM_ANCHORS];
 
 // ==================== Helper Functions ====================
+
+static unsigned long millis_now(void) {
+  return (unsigned long)(esp_timer_get_time() / 1000);
+}
+
+static void reset_radio(void) {
+  printf("[INFO] Performing radio reset...\n");
+  dwm3000_soft_reset();
+  vTaskDelay(pdMS_TO_TICKS(200));
+  dwm3000_init();
+  dwm3000_setup_gpio();
+  dwm3000_set_tx_antenna_delay(16350);
+  dwm3000_configure_as_tx();
+  dwm3000_clear_system_status();
+  printf("[INFO] Radio reset complete.\n");
+}
 
 static void initialize_anchors(void) {
   for (int i = 0; i < NUM_ANCHORS; i++) {
@@ -212,9 +233,11 @@ void app_main(void) {
 
     case 1: // Await first response
       rx_status = dwm3000_received_frame_succ();
+      // last_ranging_time = millis_now();
       if (rx_status) {
         dwm3000_clear_system_status();
         if (rx_status == 1) {
+          last_ranging_time = millis_now();
           if (dwm3000_ds_is_error_frame()) {
             printf("[WARNING] Error frame from Anchor %d! Signal strength: ",
                    currentAnchorId);
@@ -233,6 +256,15 @@ void app_main(void) {
           printf("[ERROR] Receiver Error from Anchor %d\n", currentAnchorId);
           dwm3000_clear_system_status();
         }
+      } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
+        printf("[WARNING] Timeout waiting for ranging request\n");
+        last_ranging_time = millis_now();
+        if (++retry_count > MAX_RETRIES) {
+          printf("[ERROR] Max retries reached, resetting radio\n");
+          reset_radio();
+          retry_count = 0;
+          curr_stage = 0;
+        }
       }
       break;
 
@@ -242,7 +274,7 @@ void app_main(void) {
       currentAnchor->t_roundA = currentAnchor->rx - currentAnchor->tx;
       currentAnchor->tx = dwm3000_read_tx_timestamp();
       currentAnchor->t_replyA = currentAnchor->tx - currentAnchor->rx;
-
+      last_ranging_time = millis_now();
       curr_stage = 3;
       break;
 
@@ -261,6 +293,15 @@ void app_main(void) {
         } else {
           printf("[ERROR] Receiver Error from Anchor %d\n", currentAnchorId);
           dwm3000_clear_system_status();
+        }
+      } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
+        printf("[WARNING] Timeout waiting for ranging request\n");
+        last_ranging_time = millis_now();
+        if (++retry_count > MAX_RETRIES) {
+          printf("[ERROR] Max retries reached, resetting radio\n");
+          reset_radio();
+          retry_count = 0;
+          curr_stage = 0;
         }
       }
       break;

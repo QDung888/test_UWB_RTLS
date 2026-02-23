@@ -8,7 +8,7 @@
 // ==================== Configuration ====================
 
 #define ANCHOR_ID 1
-#define RESPONSE_TIMEOUT_MS 10
+#define RESPONSE_TIMEOUT_MS 50
 #define MAX_RETRIES 3
 
 // ==================== Global Variables ====================
@@ -33,15 +33,25 @@ static unsigned long millis_now(void) {
   return (unsigned long)(esp_timer_get_time() / 1000);
 }
 
+// static void reset_radio(void) {
+//   printf("[INFO] Performing radio reset...\n");
+//   dwm3000_soft_reset();
+//   vTaskDelay(pdMS_TO_TICKS(100));
+//   dwm3000_clear_system_status();
+//   dwm3000_configure_as_tx();
+//   dwm3000_standard_rx();
+// }
+
 static void reset_radio(void) {
   printf("[INFO] Performing radio reset...\n");
   dwm3000_soft_reset();
-  vTaskDelay(pdMS_TO_TICKS(100));
+  vTaskDelay(pdMS_TO_TICKS(200));
+  dwm3000_init();
+  dwm3000_setup_gpio();
+  dwm3000_set_tx_antenna_delay(16350);
   dwm3000_clear_system_status();
-  dwm3000_configure_as_tx();
-  dwm3000_standard_rx();
+  printf("[INFO] Radio reset complete.\n");
 }
-
 // ==================== Main Application ====================
 
 void app_main(void) {
@@ -102,11 +112,11 @@ void app_main(void) {
     case 0: // Await ranging
       t_roundB = 0;
       t_replyB = 0;
-      last_ranging_time = millis_now();
       rx_status = dwm3000_received_frame_succ();
       if (rx_status) {
         dwm3000_clear_system_status();
         if (rx_status == 1) {
+          last_ranging_time = millis_now();
           if (dwm3000_get_destination_id() == ANCHOR_ID) {
             if (dwm3000_ds_is_error_frame()) {
               printf("[WARNING] Received error frame!\n");
@@ -130,12 +140,12 @@ void app_main(void) {
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
         printf("[WARNING] Timeout waiting for ranging request\n");
+        last_ranging_time = millis_now();
         if (++retry_count > MAX_RETRIES) {
           printf("[ERROR] Max retries reached, resetting radio\n");
-          reset_radio();
           retry_count = 0;
+          dwm3000_standard_rx();
         }
-        dwm3000_standard_rx();
       }
       break;
 
@@ -173,14 +183,13 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[WARNING] Timeout waiting for second response\n");
+        printf("[WARNING] Timeout waiting for ranging request\n");
+        last_ranging_time = millis_now();
         if (++retry_count > MAX_RETRIES) {
           printf("[ERROR] Max retries reached, resetting radio\n");
-          reset_radio();
           retry_count = 0;
+          dwm3000_standard_rx();
         }
-        curr_stage = 0;
-        dwm3000_standard_rx();
       }
       break;
 
