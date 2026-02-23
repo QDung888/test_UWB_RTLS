@@ -9,7 +9,7 @@
 
 // ==================== Configuration ====================
 
-#define NUM_ANCHORS 1
+#define NUM_ANCHORS 3
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
 #define RESPONSE_TIMEOUT_MS 50
