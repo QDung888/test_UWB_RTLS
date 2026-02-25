@@ -163,6 +163,18 @@ static void print_all_distances(void) {
     }
   }
   printf("\n");
+
+  // Print RSSI for each anchor
+  printf("RSSI - ");
+  for (int i = 0; i < NUM_ANCHORS; i++) {
+    printf("A%d: ", anchors[i].anchor_id);
+    dwm3000_print_double(anchors[i].signal_strength, 100, false);
+    printf(" dBm");
+    if (i < NUM_ANCHORS - 1) {
+      printf(" | ");
+    }
+  }
+  printf("\n");
 }
 
 // ==================== Main Application ====================
