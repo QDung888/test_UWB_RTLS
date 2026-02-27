@@ -783,17 +783,22 @@ class RTLSViewerApp:
                 else:
                     self.rssi_labels[aid].configure(text="— dBm")
 
-        # Compute trilateration using the 3 nearest anchors
-        valid = [(aid, dist) for aid, dist in distances.items() if dist is not None]
+        # Compute trilateration using the 3 anchors with highest RSSI
+        # Only consider anchors that have both a valid distance and a valid RSSI
+        valid = [
+            (aid, distances[aid], rssi_vals[aid])
+            for aid in distances
+            if distances[aid] is not None and rssi_vals.get(aid) is not None
+        ]
 
         if len(valid) >= 3:
-            # Sort by distance (shortest first) and pick the 3 nearest
-            valid.sort(key=lambda x: x[1])
-            nearest_3 = valid[:3]
+            # Sort by RSSI descending (highest/closest to 0 first, e.g. -70 > -90)
+            valid.sort(key=lambda x: x[2], reverse=True)
+            best_3 = valid[:3]
 
-            a1, d1 = nearest_3[0]
-            a2, d2 = nearest_3[1]
-            a3, d3 = nearest_3[2]
+            a1, d1, _ = best_3[0]
+            a2, d2, _ = best_3[1]
+            a3, d3, _ = best_3[2]
             self.selected_anchors = [a1, a2, a3]
 
             x1, y1 = self.anchors[a1]
@@ -816,7 +821,7 @@ class RTLSViewerApp:
                         self.d_actual_labels[i].configure(text=f"A{idx}: {dval:.2f} cm")
                 # Update selected anchors info
                 self.selected_info_label.configure(
-                    text=f"Using: A{a1}, A{a2}, A{a3} (nearest)"
+                    text=f"Using: A{a1}, A{a2}, A{a3} (best RSSI)"
                 )
             else:
                 for i in [1, 2, 3]:
@@ -828,7 +833,7 @@ class RTLSViewerApp:
             for i in [1, 2, 3]:
                 if i in self.d_actual_labels:
                     self.d_actual_labels[i].configure(text="— cm")
-            self.selected_info_label.configure(text="Using: — (need ≥3 distances)")
+            self.selected_info_label.configure(text="Using: — (need ≥3 with distance + RSSI)")
 
         # Update serial monitor
         raw = self.serial_reader.get_raw_line()
