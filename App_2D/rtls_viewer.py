@@ -32,11 +32,14 @@ SERIAL_REGEX = re.compile(r"A(\d+):\s*([\d.]+)\s*cm")
 RSSI_REGEX = re.compile(r"A(\d+):\s*(-?[\d.]+)\s*dBm")
 UPDATE_INTERVAL_MS = 100  # GUI refresh rate
 
+DEFAULT_NUM_ANCHORS = 4
+
 # Default anchor positions (cm)
 DEFAULT_ANCHORS = {
     1: (264.0, 20.5),
     2: (0.0, 227.0),
     3: (216.0, 585.0),
+    4: (82.0, 640.0),
 }
 
 # ========================= Colors (Dark Theme) =========================
@@ -173,16 +176,32 @@ class KalmanFilter2D:
 class SerialReader:
     """Background thread that reads serial data and updates distances."""
 
-    def __init__(self):
+    def __init__(self, num_anchors=DEFAULT_NUM_ANCHORS):
         self.port = None
         self.baud = DEFAULT_BAUD
         self.serial_conn = None
         self.running = False
         self.thread = None
-        self.distances = {1: None, 2: None, 3: None}
-        self.rssi = {1: None, 2: None, 3: None}
+        self.num_anchors = num_anchors
+        self.distances = {i: None for i in range(1, num_anchors + 1)}
+        self.rssi = {i: None for i in range(1, num_anchors + 1)}
         self.lock = threading.Lock()
         self.raw_line = ""
+
+    def set_num_anchors(self, n):
+        """Resize the distance/rssi dicts to match new anchor count."""
+        with self.lock:
+            self.num_anchors = n
+            new_dist = {i: None for i in range(1, n + 1)}
+            new_rssi = {i: None for i in range(1, n + 1)}
+            # Preserve existing values where possible
+            for aid in new_dist:
+                if aid in self.distances:
+                    new_dist[aid] = self.distances[aid]
+                if aid in self.rssi:
+                    new_rssi[aid] = self.rssi[aid]
+            self.distances = new_dist
+            self.rssi = new_rssi
 
     def connect(self, port, baud):
         self.port = port
@@ -212,7 +231,7 @@ class SerialReader:
                     continue
                 with self.lock:
                     self.raw_line = line
-                # Parse: "Distances - A1: 123.45 cm | A2: 67.89 cm | A3: 101.23 cm"
+                # Parse: "Distances - A1: 123.45 cm | A2: 67.89 cm | ..."
                 dist_matches = SERIAL_REGEX.findall(line)
                 if dist_matches:
                     with self.lock:
@@ -223,7 +242,7 @@ class SerialReader:
                                     self.distances[aid] = float(dist_str)
                                 except ValueError:
                                     pass
-                # Parse: "RSSI - A1: -85.23 dBm | A2: -79.45 dBm | A3: -82.10 dBm"
+                # Parse: "RSSI - A1: -85.23 dBm | A2: -79.45 dBm | ..."
                 rssi_matches = RSSI_REGEX.findall(line)
                 if rssi_matches:
                     with self.lock:
@@ -265,12 +284,15 @@ class RTLSViewerApp:
         self.root.state("zoomed")  # Start maximized on Windows
         self.root.minsize(1100, 700)
 
-        self.serial_reader = SerialReader()
-        self.anchors = dict(DEFAULT_ANCHORS)
+        self.num_anchors = DEFAULT_NUM_ANCHORS
+        self.serial_reader = SerialReader(num_anchors=self.num_anchors)
+        self.anchors = {aid: DEFAULT_ANCHORS.get(aid, (0.0, 0.0))
+                        for aid in range(1, self.num_anchors + 1)}
         self.tag_pos = None
         self.tag_history = []  # Trail of previous tag positions
         self.max_trail = 50
         self.kalman = KalmanFilter2D(dt=UPDATE_INTERVAL_MS / 1000.0)
+        self.selected_anchors = []  # IDs of the 3 anchors used for trilateration
 
         self._build_styles()
         self._build_ui()
@@ -353,13 +375,13 @@ class RTLSViewerApp:
         # Top bar
         self._build_top_bar()
         # Main content: left panel + map
-        main = ttk.Frame(self.root, style="Dark.TFrame")
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=1)
+        self.main_frame = ttk.Frame(self.root, style="Dark.TFrame")
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.main_frame.columnconfigure(1, weight=1)
+        self.main_frame.rowconfigure(0, weight=1)
 
-        self._build_left_panel(main)
-        self._build_map(main)
+        self._build_left_panel(self.main_frame)
+        self._build_map(self.main_frame)
         # Status bar
         self._build_status_bar()
 
@@ -395,6 +417,15 @@ class RTLSViewerApp:
         )
         baud_combo.pack(side=tk.LEFT, padx=(0, 12))
 
+        # Number of Anchors
+        ttk.Label(bar, text="Anchors:", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        self.anchor_count_var = tk.IntVar(value=self.num_anchors)
+        anchor_spin = ttk.Spinbox(
+            bar, from_=3, to=8, textvariable=self.anchor_count_var,
+            width=4, state="readonly", command=self._on_anchor_count_change
+        )
+        anchor_spin.pack(side=tk.LEFT, padx=(0, 12))
+
         # Connect / Disconnect
         self.connect_btn = ttk.Button(
             bar, text="Connect", style="Accent.TButton", command=self._toggle_connection
@@ -407,22 +438,55 @@ class RTLSViewerApp:
         self._draw_indicator(False)
 
     def _build_left_panel(self, parent):
-        left = ttk.Frame(parent, style="Panel.TFrame", width=320)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left.grid_propagate(False)
+        self.left_panel = ttk.Frame(parent, style="Panel.TFrame", width=320)
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.left_panel.grid_propagate(False)
+
+        self._populate_left_panel()
+
+    def _populate_left_panel(self):
+        """Fill (or re-fill) the left panel with widgets for the current anchor count."""
+        left = self.left_panel
+
+        # Clear all existing children
+        for child in left.winfo_children():
+            child.destroy()
+
+        # Add a scrollable canvas for the left panel content
+        canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas, style="Panel.TFrame")
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=306)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Enable mouse wheel scrolling
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         pad = {"padx": 12, "pady": 4}
         pad_section = {"padx": 12, "pady": (16, 4)}
+        anchor_ids = list(range(1, self.num_anchors + 1))
 
         # ---- Anchor Coordinates ----
-        ttk.Label(left, text="📍 Anchor Coordinates (cm)", style="Header.TLabel").pack(
+        ttk.Label(scroll_frame, text="📍 Anchor Coordinates (cm)", style="Header.TLabel").pack(
             anchor="w", **pad_section
         )
-        ttk.Separator(left, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
+        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
 
         self.anchor_entries = {}
-        for aid, (dx, dy) in DEFAULT_ANCHORS.items():
-            frame = ttk.Frame(left, style="Panel.TFrame")
+        for aid in anchor_ids:
+            dx, dy = self.anchors.get(aid, (0.0, 0.0))
+            frame = ttk.Frame(scroll_frame, style="Panel.TFrame")
             frame.pack(fill=tk.X, **pad)
             ttk.Label(frame, text=f"A{aid}:", style="Dark.TLabel", width=4).pack(side=tk.LEFT)
             ttk.Label(frame, text="X:", style="Dark.TLabel").pack(side=tk.LEFT)
@@ -441,18 +505,18 @@ class RTLSViewerApp:
             ey.pack(side=tk.LEFT)
             self.anchor_entries[aid] = (ex, ey)
 
-        ttk.Button(left, text="Apply Coordinates", style="Accent.TButton",
+        ttk.Button(scroll_frame, text="Apply Coordinates", style="Accent.TButton",
                     command=self._apply_anchors).pack(pady=(8, 4), padx=12, fill=tk.X)
 
         # ---- Measured Distances ----
-        ttk.Label(left, text="📏 Measured Distances", style="Header.TLabel").pack(
+        ttk.Label(scroll_frame, text="📏 Measured Distances", style="Header.TLabel").pack(
             anchor="w", **pad_section
         )
-        ttk.Separator(left, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
+        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
 
         self.dist_labels = {}
-        for aid in [1, 2, 3]:
-            frame = ttk.Frame(left, style="Panel.TFrame")
+        for aid in anchor_ids:
+            frame = ttk.Frame(scroll_frame, style="Panel.TFrame")
             frame.pack(fill=tk.X, **pad)
             ttk.Label(frame, text=f"  d{aid} (A{aid}):", style="Dark.TLabel", width=10).pack(
                 side=tk.LEFT
@@ -462,14 +526,14 @@ class RTLSViewerApp:
             self.dist_labels[aid] = lbl
 
         # ---- RSSI ----
-        ttk.Label(left, text="📶 RSSI (Signal Strength)", style="Header.TLabel").pack(
+        ttk.Label(scroll_frame, text="📶 RSSI (Signal Strength)", style="Header.TLabel").pack(
             anchor="w", **pad_section
         )
-        ttk.Separator(left, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
+        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
 
         self.rssi_labels = {}
-        for aid in [1, 2, 3]:
-            frame = ttk.Frame(left, style="Panel.TFrame")
+        for aid in anchor_ids:
+            frame = ttk.Frame(scroll_frame, style="Panel.TFrame")
             frame.pack(fill=tk.X, **pad)
             ttk.Label(frame, text=f"  A{aid}:", style="Dark.TLabel", width=10).pack(
                 side=tk.LEFT
@@ -478,15 +542,15 @@ class RTLSViewerApp:
             lbl.pack(side=tk.LEFT, padx=(8, 0))
             self.rssi_labels[aid] = lbl
 
-        # ---- Actual Position (D1T, D2T, D3T) ----
-        ttk.Label(left, text="📐 Actual Position (2D)", style="Header.TLabel").pack(
+        # ---- Actual Position (D*T for the 3 selected anchors) ----
+        ttk.Label(scroll_frame, text="📐 Actual Position (2D)", style="Header.TLabel").pack(
             anchor="w", **pad_section
         )
-        ttk.Separator(left, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
+        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
 
         self.d_actual_labels = {}
         for i in [1, 2, 3]:
-            frame = ttk.Frame(left, style="Panel.TFrame")
+            frame = ttk.Frame(scroll_frame, style="Panel.TFrame")
             frame.pack(fill=tk.X, **pad)
             ttk.Label(frame, text=f"  D{i}T:", style="Dark.TLabel", width=10).pack(
                 side=tk.LEFT
@@ -495,13 +559,19 @@ class RTLSViewerApp:
             lbl.pack(side=tk.LEFT, padx=(8, 0))
             self.d_actual_labels[i] = lbl
 
+        # ---- Selected Anchors Info ----
+        self.selected_info_label = ttk.Label(
+            scroll_frame, text="Using: —", style="Dark.TLabel"
+        )
+        self.selected_info_label.pack(anchor="w", padx=12, pady=(4, 0))
+
         # ---- Serial Monitor ----
-        ttk.Label(left, text="📡 Serial Monitor", style="Header.TLabel").pack(
+        ttk.Label(scroll_frame, text="📡 Serial Monitor", style="Header.TLabel").pack(
             anchor="w", **pad_section
         )
-        ttk.Separator(left, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
+        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, padx=12, pady=2)
         self.serial_text = tk.Text(
-            left, height=6, bg=BG_INPUT, fg=FG_TEXT, font=("Consolas", 9),
+            scroll_frame, height=6, bg=BG_INPUT, fg=FG_TEXT, font=("Consolas", 9),
             relief="flat", bd=4, wrap=tk.WORD, state=tk.DISABLED
         )
         self.serial_text.pack(fill=tk.X, padx=12, pady=4)
@@ -556,6 +626,42 @@ class RTLSViewerApp:
         self.conn_indicator.delete("all")
         color = FG_SUCCESS if connected else FG_WARN
         self.conn_indicator.create_oval(2, 2, 14, 14, fill=color, outline="")
+
+    # -------------------- Anchor Count Change --------------------
+
+    def _on_anchor_count_change(self):
+        """Called when the user changes the anchor count spinbox."""
+        new_count = self.anchor_count_var.get()
+        if new_count == self.num_anchors:
+            return
+
+        # Save current anchor coordinates from entries before rebuild
+        for aid, (ex, ey) in self.anchor_entries.items():
+            try:
+                self.anchors[aid] = (float(ex.get()), float(ey.get()))
+            except ValueError:
+                pass
+
+        self.num_anchors = new_count
+
+        # Expand or shrink anchor dict
+        new_anchors = {}
+        for aid in range(1, new_count + 1):
+            new_anchors[aid] = self.anchors.get(aid, (0.0, 0.0))
+        self.anchors = new_anchors
+
+        # Update serial reader
+        self.serial_reader.set_num_anchors(new_count)
+
+        # Reset state
+        self.tag_history.clear()
+        self.tag_pos = None
+        self.kalman = KalmanFilter2D(dt=UPDATE_INTERVAL_MS / 1000.0)
+        self.selected_anchors = []
+
+        # Rebuild the left panel
+        self._populate_left_panel()
+        self._draw_map()
 
     # -------------------- Anchor Coordinate Input --------------------
 
@@ -629,9 +735,12 @@ class RTLSViewerApp:
 
         # Draw anchors (drawn last so they appear on top)
         for aid, (ax_pos, ay_pos) in self.anchors.items():
+            # Highlight the 3 selected anchors used for trilateration
+            is_selected = aid in self.selected_anchors
+            marker_color = FG_SUCCESS if is_selected else FG_ANCHOR
             ax.plot(
                 ax_pos, ay_pos,
-                "D", color=FG_ANCHOR, markersize=10,
+                "D", color=marker_color, markersize=10,
                 markeredgecolor="#fff", markeredgewidth=1.5, zorder=11
             )
             dist_text = ""
@@ -642,8 +751,8 @@ class RTLSViewerApp:
                 f"A{aid}\n({ax_pos:.0f},{ay_pos:.0f}){dist_text}",
                 (ax_pos, ay_pos),
                 textcoords="offset points", xytext=(12, -18),
-                color=FG_ANCHOR, fontsize=9, fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=BG_PANEL, edgecolor=FG_ANCHOR, alpha=0.85)
+                color=marker_color, fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=BG_PANEL, edgecolor=marker_color, alpha=0.85)
             )
 
         self.fig.tight_layout()
@@ -653,30 +762,44 @@ class RTLSViewerApp:
 
     def _update_loop(self):
         distances = self.serial_reader.get_distances()
+        anchor_ids = list(range(1, self.num_anchors + 1))
 
         # Update distance labels
-        for aid in [1, 2, 3]:
+        for aid in anchor_ids:
             d = distances.get(aid)
-            if d is not None:
-                self.dist_labels[aid].configure(text=f"{d:.2f} cm")
-            else:
-                self.dist_labels[aid].configure(text="— cm")
+            if aid in self.dist_labels:
+                if d is not None:
+                    self.dist_labels[aid].configure(text=f"{d:.2f} cm")
+                else:
+                    self.dist_labels[aid].configure(text="— cm")
 
         # Update RSSI labels
         rssi_vals = self.serial_reader.get_rssi()
-        for aid in [1, 2, 3]:
+        for aid in anchor_ids:
             r = rssi_vals.get(aid)
-            if r is not None:
-                self.rssi_labels[aid].configure(text=f"{r:.2f} dBm")
-            else:
-                self.rssi_labels[aid].configure(text="— dBm")
+            if aid in self.rssi_labels:
+                if r is not None:
+                    self.rssi_labels[aid].configure(text=f"{r:.2f} dBm")
+                else:
+                    self.rssi_labels[aid].configure(text="— dBm")
 
-        # Compute trilateration
-        d1, d2, d3 = distances.get(1), distances.get(2), distances.get(3)
-        if d1 is not None and d2 is not None and d3 is not None:
-            x1, y1 = self.anchors[1]
-            x2, y2 = self.anchors[2]
-            x3, y3 = self.anchors[3]
+        # Compute trilateration using the 3 nearest anchors
+        valid = [(aid, dist) for aid, dist in distances.items() if dist is not None]
+
+        if len(valid) >= 3:
+            # Sort by distance (shortest first) and pick the 3 nearest
+            valid.sort(key=lambda x: x[1])
+            nearest_3 = valid[:3]
+
+            a1, d1 = nearest_3[0]
+            a2, d2 = nearest_3[1]
+            a3, d3 = nearest_3[2]
+            self.selected_anchors = [a1, a2, a3]
+
+            x1, y1 = self.anchors[a1]
+            x2, y2 = self.anchors[a2]
+            x3, y3 = self.anchors[a3]
+
             result = trilaterate(x1, y1, d1, x2, y2, d2, x3, y3, d3)
             if result:
                 x_tag, y_tag, D1T, D2T, D3T = result
@@ -686,16 +809,26 @@ class RTLSViewerApp:
                 self.tag_history.append((filtered_x, filtered_y))
                 if len(self.tag_history) > self.max_trail:
                     self.tag_history.pop(0)
-                # Update Actual Position labels
-                self.d_actual_labels[1].configure(text=f"{D1T:.2f} cm")
-                self.d_actual_labels[2].configure(text=f"{D2T:.2f} cm")
-                self.d_actual_labels[3].configure(text=f"{D3T:.2f} cm")
+                # Update Actual Position labels (show which anchors are used)
+                d_vals = [D1T, D2T, D3T]
+                for i, (idx, dval) in enumerate(zip([a1, a2, a3], d_vals), start=1):
+                    if i in self.d_actual_labels:
+                        self.d_actual_labels[i].configure(text=f"A{idx}: {dval:.2f} cm")
+                # Update selected anchors info
+                self.selected_info_label.configure(
+                    text=f"Using: A{a1}, A{a2}, A{a3} (nearest)"
+                )
             else:
                 for i in [1, 2, 3]:
-                    self.d_actual_labels[i].configure(text="ERROR")
+                    if i in self.d_actual_labels:
+                        self.d_actual_labels[i].configure(text="ERROR")
+                self.selected_info_label.configure(text="Using: ERROR (degenerate)")
         else:
+            self.selected_anchors = []
             for i in [1, 2, 3]:
-                self.d_actual_labels[i].configure(text="— cm")
+                if i in self.d_actual_labels:
+                    self.d_actual_labels[i].configure(text="— cm")
+            self.selected_info_label.configure(text="Using: — (need ≥3 distances)")
 
         # Update serial monitor
         raw = self.serial_reader.get_raw_line()

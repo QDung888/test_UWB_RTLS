@@ -9,7 +9,7 @@
 
 // ==================== Configuration ====================
 
-#define NUM_ANCHORS 3
+#define NUM_ANCHORS 4
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
 #define RESPONSE_TIMEOUT_MS 50
@@ -276,6 +276,7 @@ void app_main(void) {
           reset_radio();
           retry_count = 0;
           curr_stage = 0;
+          switch_to_next_anchor();
         }
       }
       break;
@@ -314,6 +315,7 @@ void app_main(void) {
           reset_radio();
           retry_count = 0;
           curr_stage = 0;
+          switch_to_next_anchor();
         }
       }
       break;

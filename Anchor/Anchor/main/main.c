@@ -7,7 +7,7 @@
 
 // ==================== Configuration ====================
 
-#define ANCHOR_ID 3
+#define ANCHOR_ID 4
 #define RESPONSE_TIMEOUT_MS 50
 #define MAX_RETRIES 3
 
