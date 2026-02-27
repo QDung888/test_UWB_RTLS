@@ -5,8 +5,8 @@ Receives distance data from a UWB Tag via serial (pyserial),
 computes the Tag's 2D position using trilateration, and displays
 anchors + tag on a real-time 2D map.
 
-Dependencies: pyserial, matplotlib
-    pip install pyserial matplotlib
+Dependencies: pyserial, matplotlib, numpy
+    pip install pyserial matplotlib numpy
 """
 
 import re
@@ -18,6 +18,7 @@ import serial
 import serial.tools.list_ports
 import matplotlib
 import math
+import numpy as np
 
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -89,6 +90,82 @@ def trilaterate(x1, y1, d1, x2, y2, d2, x3, y3, d3):
     y_tag = (C * D - A * F) / denom_y
 
     return (x_tag, y_tag, D1T, D2T, D3T)
+
+
+# ========================= Kalman Filter =========================
+
+class KalmanFilter2D:
+    """
+    2D constant-velocity Kalman filter for smoothing (x, y) positions.
+
+    State vector: [x, vx, y, vy]
+    Measurement:  [x, y]
+    """
+
+    def __init__(self, dt=0.1, process_noise=5.0, measurement_noise=50.0):
+        self.dt = dt
+
+        # State vector [x, vx, y, vy]
+        self.x = np.zeros((4, 1))
+
+        # State covariance matrix
+        self.P = np.eye(4) * 500.0
+
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, dt, 0,  0],
+            [0,  1, 0,  0],
+            [0,  0, 1, dt],
+            [0,  0, 0,  1]
+        ])
+
+        # Measurement matrix (we only observe x and y)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 0, 1, 0]
+        ])
+
+        # Process noise covariance
+        q = process_noise
+        self.Q = np.array([
+            [dt**4/4, dt**3/2, 0,       0      ],
+            [dt**3/2, dt**2,   0,       0      ],
+            [0,       0,       dt**4/4, dt**3/2],
+            [0,       0,       dt**3/2, dt**2  ]
+        ]) * q
+
+        # Measurement noise covariance
+        self.R = np.eye(2) * measurement_noise
+
+        self._initialized = False
+
+    def update(self, meas_x, meas_y):
+        """
+        Feed a new (x, y) measurement. Returns the filtered (x, y).
+        """
+        z = np.array([[meas_x], [meas_y]])
+
+        if not self._initialized:
+            # First measurement — initialise state directly
+            self.x[0, 0] = meas_x
+            self.x[2, 0] = meas_y
+            self._initialized = True
+            return (meas_x, meas_y)
+
+        # --- Predict ---
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # --- Update ---
+        y = z - self.H @ self.x                        # Innovation
+        S = self.H @ self.P @ self.H.T + self.R        # Innovation covariance
+        K = self.P @ self.H.T @ np.linalg.inv(S)       # Kalman gain
+
+        self.x = self.x + K @ y
+        I = np.eye(4)
+        self.P = (I - K @ self.H) @ self.P
+
+        return (float(self.x[0, 0]), float(self.x[2, 0]))
 
 
 # ========================= Serial Reader =========================
@@ -193,6 +270,7 @@ class RTLSViewerApp:
         self.tag_pos = None
         self.tag_history = []  # Trail of previous tag positions
         self.max_trail = 50
+        self.kalman = KalmanFilter2D(dt=UPDATE_INTERVAL_MS / 1000.0)
 
         self._build_styles()
         self._build_ui()
@@ -489,6 +567,7 @@ class RTLSViewerApp:
                 self.anchors[aid] = (x, y)
             # Clear trail on anchor change
             self.tag_history.clear()
+            self.kalman = KalmanFilter2D(dt=UPDATE_INTERVAL_MS / 1000.0)
             self._draw_map()
         except ValueError:
             messagebox.showwarning("Invalid Input", "Please enter valid numeric coordinates.")
@@ -601,8 +680,10 @@ class RTLSViewerApp:
             result = trilaterate(x1, y1, d1, x2, y2, d2, x3, y3, d3)
             if result:
                 x_tag, y_tag, D1T, D2T, D3T = result
-                self.tag_pos = (x_tag, y_tag)
-                self.tag_history.append((x_tag, y_tag))
+                # Apply Kalman filter to smooth the position
+                filtered_x, filtered_y = self.kalman.update(x_tag, y_tag)
+                self.tag_pos = (filtered_x, filtered_y)
+                self.tag_history.append((filtered_x, filtered_y))
                 if len(self.tag_history) > self.max_trail:
                     self.tag_history.pop(0)
                 # Update Actual Position labels
