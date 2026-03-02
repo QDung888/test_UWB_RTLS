@@ -12,8 +12,10 @@
 #define NUM_ANCHORS 4
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
-#define RESPONSE_TIMEOUT_MS 10
+#define RESPONSE_TIMEOUT_MS 30
 #define MAX_RETRIES 3
+#define ANCHOR_TIMEOUT_RETRIES 2
+#define ANCHOR_EXCLUDE_DURATION_MS 5000
 
 #define FILTER_SIZE 30
 #define MIN_DISTANCE 0
@@ -40,6 +42,11 @@ typedef struct {
   // Signal quality metrics
   float signal_strength;
   float fp_signal_strength;
+
+  // Timeout / exclusion tracking
+  int timeout_retry_count;
+  bool excluded;
+  unsigned long exclude_start_time;
 } AnchorData;
 
 // ==================== Global Variables ====================
@@ -51,6 +58,7 @@ static int curr_stage = 0;
 
 static unsigned long last_ranging_time = 0;
 static int retry_count = 0;
+static int active_anchor_count = NUM_ANCHORS;
 
 static AnchorData anchors[NUM_ANCHORS];
 
@@ -87,8 +95,69 @@ static int get_current_anchor_id(void) {
   return anchors[current_anchor_index].anchor_id;
 }
 
+static void check_excluded_anchors(void) {
+  unsigned long now = millis_now();
+  for (int i = 0; i < NUM_ANCHORS; i++) {
+    if (anchors[i].excluded &&
+        (now - anchors[i].exclude_start_time >= ANCHOR_EXCLUDE_DURATION_MS)) {
+      anchors[i].excluded = false;
+      anchors[i].timeout_retry_count = 0;
+      active_anchor_count++;
+      printf("[INFO] Anchor %d re-included after exclusion period\n",
+             anchors[i].anchor_id);
+    }
+  }
+}
+
+static void exclude_anchor(AnchorData *anchor) {
+  anchor->excluded = true;
+  anchor->exclude_start_time = millis_now();
+  active_anchor_count--;
+
+  // Clear stale measurement data so old values are not used after re-inclusion
+  anchor->filtered_distance = 0;
+  anchor->distance = 0;
+  anchor->signal_strength = 0;
+  anchor->fp_signal_strength = 0;
+  anchor->history_index = 0;
+  memset(anchor->distance_history, 0, sizeof(anchor->distance_history));
+
+  printf(
+      "[WARNING] Anchor %d excluded for %d ms due to %d consecutive timeouts\n",
+      anchor->anchor_id, ANCHOR_EXCLUDE_DURATION_MS, ANCHOR_TIMEOUT_RETRIES);
+}
+
 static void switch_to_next_anchor(void) {
-  current_anchor_index = (current_anchor_index + 1) % NUM_ANCHORS;
+  // First, check if any excluded anchors should be re-included
+  check_excluded_anchors();
+
+  // If all anchors are excluded, force re-include the one with the oldest
+  // exclusion
+  if (active_anchor_count <= 0) {
+    printf("[WARNING] All anchors excluded! Force re-including oldest excluded "
+           "anchor\n");
+    int oldest_idx = -1;
+    unsigned long oldest_time = UINT32_MAX;
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+      if (anchors[i].excluded && anchors[i].exclude_start_time < oldest_time) {
+        oldest_time = anchors[i].exclude_start_time;
+        oldest_idx = i;
+      }
+    }
+    if (oldest_idx >= 0) {
+      anchors[oldest_idx].excluded = false;
+      anchors[oldest_idx].timeout_retry_count = 0;
+      active_anchor_count++;
+    }
+  }
+
+  // Find the next non-excluded anchor
+  for (int i = 0; i < NUM_ANCHORS; i++) {
+    current_anchor_index = (current_anchor_index + 1) % NUM_ANCHORS;
+    if (!anchors[current_anchor_index].excluded) {
+      return;
+    }
+  }
 }
 
 static bool all_anchors_have_valid_data(void) {
@@ -151,7 +220,9 @@ static void print_all_distances(void) {
   printf("Distances - ");
   for (int i = 0; i < NUM_ANCHORS; i++) {
     printf("A%d: ", anchors[i].anchor_id);
-    if (anchors[i].filtered_distance > 0) {
+    if (anchors[i].excluded) {
+      printf("INVALID");
+    } else if (anchors[i].filtered_distance > 0) {
       dwm3000_print_double(anchors[i].filtered_distance, 100, false);
       printf(" cm");
     } else {
@@ -168,8 +239,12 @@ static void print_all_distances(void) {
   printf("RSSI - ");
   for (int i = 0; i < NUM_ANCHORS; i++) {
     printf("A%d: ", anchors[i].anchor_id);
-    dwm3000_print_double(anchors[i].signal_strength, 100, false);
-    printf(" dBm");
+    if (anchors[i].excluded) {
+      printf("INVALID");
+    } else {
+      dwm3000_print_double(anchors[i].signal_strength, 100, false);
+      printf(" dBm");
+    }
     if (i < NUM_ANCHORS - 1) {
       printf(" | ");
     }
@@ -269,8 +344,14 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[ERROR] Resetting radio\n");
+        currentAnchor->timeout_retry_count++;
+        printf("[ERROR] Timeout Anchor %d (retry %d/%d), resetting radio\n",
+               currentAnchorId, currentAnchor->timeout_retry_count,
+               ANCHOR_TIMEOUT_RETRIES);
         reset_radio();
+        if (currentAnchor->timeout_retry_count > ANCHOR_TIMEOUT_RETRIES) {
+          exclude_anchor(currentAnchor);
+        }
         curr_stage = 0;
         switch_to_next_anchor();
         last_ranging_time = millis_now();
@@ -304,12 +385,17 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[WARNING] Timeout waiting for ranging request\n");
+        currentAnchor->timeout_retry_count++;
+        printf("[WARNING] Timeout Anchor %d (retry %d/%d)\n", currentAnchorId,
+               currentAnchor->timeout_retry_count, ANCHOR_TIMEOUT_RETRIES);
         last_ranging_time = millis_now();
         if (++retry_count > MAX_RETRIES) {
           printf("[ERROR] Max retries reached, resetting radio\n");
           reset_radio();
           retry_count = 0;
+          if (currentAnchor->timeout_retry_count > ANCHOR_TIMEOUT_RETRIES) {
+            exclude_anchor(currentAnchor);
+          }
           curr_stage = 0;
           switch_to_next_anchor();
         }
@@ -328,6 +414,7 @@ void app_main(void) {
       currentAnchor->fp_signal_strength =
           dwm3000_get_first_path_signal_strength();
       update_filtered_distance(currentAnchor);
+      currentAnchor->timeout_retry_count = 0; // Reset on successful ranging
     }
 
       print_all_distances();

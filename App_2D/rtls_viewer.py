@@ -30,6 +30,8 @@ import matplotlib.patches as patches
 DEFAULT_BAUD = 115200
 SERIAL_REGEX = re.compile(r"A(\d+):\s*([\d.]+)\s*cm")
 RSSI_REGEX = re.compile(r"A(\d+):\s*(-?[\d.]+)\s*dBm")
+DIST_INVALID_REGEX = re.compile(r"A(\d+):\s*INVALID")
+FG_INVALID = "#ff4444"  # Red for disconnected/excluded anchors
 UPDATE_INTERVAL_MS = 100  # GUI refresh rate
 
 DEFAULT_NUM_ANCHORS = 4
@@ -231,10 +233,17 @@ class SerialReader:
                     continue
                 with self.lock:
                     self.raw_line = line
-                # Parse: "Distances - A1: 123.45 cm | A2: 67.89 cm | ..."
-                dist_matches = SERIAL_REGEX.findall(line)
-                if dist_matches:
+                # Parse: "Distances - A1: 123.45 cm | A2: INVALID | ..."
+                if line.startswith("Distances"):
+                    dist_matches = SERIAL_REGEX.findall(line)
+                    invalid_matches = DIST_INVALID_REGEX.findall(line)
                     with self.lock:
+                        # Set INVALID anchors to None first
+                        for anchor_id_str in invalid_matches:
+                            aid = int(anchor_id_str)
+                            if aid in self.distances:
+                                self.distances[aid] = None
+                        # Set valid distances
                         for anchor_id_str, dist_str in dist_matches:
                             aid = int(anchor_id_str)
                             if aid in self.distances:
@@ -242,10 +251,17 @@ class SerialReader:
                                     self.distances[aid] = float(dist_str)
                                 except ValueError:
                                     pass
-                # Parse: "RSSI - A1: -85.23 dBm | A2: -79.45 dBm | ..."
-                rssi_matches = RSSI_REGEX.findall(line)
-                if rssi_matches:
+                # Parse: "RSSI - A1: -85.23 dBm | A2: INVALID | ..."
+                if line.startswith("RSSI"):
+                    rssi_matches = RSSI_REGEX.findall(line)
+                    rssi_invalid_matches = DIST_INVALID_REGEX.findall(line)
                     with self.lock:
+                        # Set INVALID anchors to None first
+                        for anchor_id_str in rssi_invalid_matches:
+                            aid = int(anchor_id_str)
+                            if aid in self.rssi:
+                                self.rssi[aid] = None
+                        # Set valid RSSI
                         for anchor_id_str, rssi_str in rssi_matches:
                             aid = int(anchor_id_str)
                             if aid in self.rssi:
@@ -735,18 +751,29 @@ class RTLSViewerApp:
 
         # Draw anchors (drawn last so they appear on top)
         for aid, (ax_pos, ay_pos) in self.anchors.items():
-            # Highlight the 3 selected anchors used for trilateration
+            d = distances.get(aid)
+            is_invalid = (d is None)
             is_selected = aid in self.selected_anchors
-            marker_color = FG_SUCCESS if is_selected else FG_ANCHOR
+
+            # Red for invalid/excluded, green for selected, blue for normal
+            if is_invalid:
+                marker_color = FG_INVALID
+            elif is_selected:
+                marker_color = FG_SUCCESS
+            else:
+                marker_color = FG_ANCHOR
+
             ax.plot(
                 ax_pos, ay_pos,
                 "D", color=marker_color, markersize=10,
                 markeredgecolor="#fff", markeredgewidth=1.5, zorder=11
             )
-            dist_text = ""
-            d = distances.get(aid)
-            if d is not None:
+            if is_invalid:
+                dist_text = "\nINVALID"
+            elif d is not None:
                 dist_text = f"\nd={d:.1f}"
+            else:
+                dist_text = ""
             ax.annotate(
                 f"A{aid}\n({ax_pos:.0f},{ay_pos:.0f}){dist_text}",
                 (ax_pos, ay_pos),
@@ -764,14 +791,14 @@ class RTLSViewerApp:
         distances = self.serial_reader.get_distances()
         anchor_ids = list(range(1, self.num_anchors + 1))
 
-        # Update distance labels
+        # Update distance labels (show INVALID in red for excluded anchors)
         for aid in anchor_ids:
             d = distances.get(aid)
             if aid in self.dist_labels:
                 if d is not None:
-                    self.dist_labels[aid].configure(text=f"{d:.2f} cm")
+                    self.dist_labels[aid].configure(text=f"{d:.2f} cm", foreground=FG_TEXT)
                 else:
-                    self.dist_labels[aid].configure(text="— cm")
+                    self.dist_labels[aid].configure(text="INVALID", foreground=FG_INVALID)
 
         # Update RSSI labels
         rssi_vals = self.serial_reader.get_rssi()
@@ -779,9 +806,9 @@ class RTLSViewerApp:
             r = rssi_vals.get(aid)
             if aid in self.rssi_labels:
                 if r is not None:
-                    self.rssi_labels[aid].configure(text=f"{r:.2f} dBm")
+                    self.rssi_labels[aid].configure(text=f"{r:.2f} dBm", foreground=FG_TEXT)
                 else:
-                    self.rssi_labels[aid].configure(text="— dBm")
+                    self.rssi_labels[aid].configure(text="INVALID", foreground=FG_INVALID)
 
         # Compute trilateration using the 3 anchors with highest RSSI
         # Only consider anchors that have both a valid distance and a valid RSSI
