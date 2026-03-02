@@ -7,8 +7,8 @@
 
 // ==================== Configuration ====================
 
-#define ANCHOR_ID 4
-#define RESPONSE_TIMEOUT_MS 50
+#define ANCHOR_ID 3
+#define RESPONSE_TIMEOUT_MS 10
 #define MAX_RETRIES 3
 
 // ==================== Global Variables ====================
@@ -139,13 +139,10 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[WARNING] Timeout waiting for ranging request\n");
+        printf("[ERROR] Resetting radio\n");
+        retry_count = 0;
+        dwm3000_standard_rx();
         last_ranging_time = millis_now();
-        if (++retry_count > MAX_RETRIES) {
-          printf("[ERROR] Max retries reached, resetting radio\n");
-          retry_count = 0;
-          dwm3000_standard_rx();
-        }
       }
       break;
 
@@ -183,13 +180,10 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[WARNING] Timeout waiting for ranging request\n");
+        printf("[ERROR] Resetting radio\n");
+        retry_count = 0;
+        dwm3000_standard_rx();
         last_ranging_time = millis_now();
-        if (++retry_count > MAX_RETRIES) {
-          printf("[ERROR] Max retries reached, resetting radio\n");
-          retry_count = 0;
-          dwm3000_standard_rx();
-        }
       }
       break;
 

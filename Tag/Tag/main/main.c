@@ -12,7 +12,7 @@
 #define NUM_ANCHORS 4
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
-#define RESPONSE_TIMEOUT_MS 50
+#define RESPONSE_TIMEOUT_MS 10
 #define MAX_RETRIES 3
 
 #define FILTER_SIZE 30
@@ -269,15 +269,11 @@ void app_main(void) {
           dwm3000_clear_system_status();
         }
       } else if (millis_now() - last_ranging_time > RESPONSE_TIMEOUT_MS) {
-        printf("[WARNING] Timeout waiting for ranging request\n");
+        printf("[ERROR] Resetting radio\n");
+        reset_radio();
+        curr_stage = 0;
+        switch_to_next_anchor();
         last_ranging_time = millis_now();
-        if (++retry_count > MAX_RETRIES) {
-          printf("[ERROR] Max retries reached, resetting radio\n");
-          reset_radio();
-          retry_count = 0;
-          curr_stage = 0;
-          switch_to_next_anchor();
-        }
       }
       break;
 
